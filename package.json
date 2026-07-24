@@ -1,0 +1,32 @@
+{
+  "name": "pi-virtual-context",
+	"version": "0.3.0",
+  "private": true,
+  "description": "Non-invasive provider-context projection for long Pi coding-agent sessions.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+		"typecheck": "tsc --noEmit",
+    "pack:check": "npm pack --dry-run"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": ">=0.81.0",
+		"@earendil-works/pi-coding-agent": ">=0.81.0"
+	},
+	"devDependencies": {
+		"typescript": "^5.9.3"
+	}
+}
