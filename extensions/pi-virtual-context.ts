@@ -14,6 +14,8 @@ import {
 	DEFAULT_CONFIG,
 	mergeConfigValues,
 	normalizeConfig,
+	resolveThresholds,
+	type ResolvedThresholds,
 	type VirtualContextConfig,
 	type VirtualContextMode,
 } from "../src/config.ts";
@@ -90,7 +92,7 @@ async function loadConfig(cwd: string): Promise<{ config: VirtualContextConfig; 
 	return normalizeConfig(mergeConfigValues(globalSettings["virtual-context"], projectSettings["virtual-context"]));
 }
 
-function statusText(state: RuntimeState): string {
+function statusText(state: RuntimeState, thresholds: ResolvedThresholds): string {
 	const active = state.active ? `${state.active.kind}, cut=${state.active.cutIndex}` : "none";
 	const pending = state.pending ? (state.pending.ready ? "ready" : state.pending.error ? `error: ${state.pending.error}` : "running") : "none";
 	const current = state.stats.projectedTokens === undefined
@@ -101,7 +103,7 @@ function statusText(state: RuntimeState): string {
 		: "none";
 	return [
 		`Mode: ${state.mode}`,
-		`Thresholds: prepare ${state.config.prepareTokens.toLocaleString()} / swap ${state.config.swapTokens.toLocaleString()} / target ${state.config.targetTokens.toLocaleString()} / emergency ${state.config.emergencyTokens.toLocaleString()}`,
+		`Thresholds (${thresholds.source}): prepare ${thresholds.prepareTokens.toLocaleString()} / swap ${thresholds.swapTokens.toLocaleString()} / target ${thresholds.targetTokens.toLocaleString()} / emergency ${thresholds.emergencyTokens.toLocaleString()}`,
 		`Current request: ${current}`,
 		`Last projection: ${lastProjection}`,
 		`Checkpoint: active ${active} / pending ${pending}`,
@@ -163,6 +165,7 @@ function startSmartCheckpoint(
 	messages: AgentMessage[],
 	rawTokens: number,
 	ctx: ExtensionContext,
+	thresholds: ResolvedThresholds,
 ): void {
 	const cutIndex = chooseCutIndex(messages, state.config.keepRecentTokens);
 	if (cutIndex <= 0 || cutIndex >= messages.length) return;
@@ -197,7 +200,7 @@ function startSmartCheckpoint(
 	let brokerSignal: AbortSignal | undefined;
 	task.promise = withBackgroundLease({
 		owner: `virtual-context:${state.sessionId}`,
-		priority: rawTokens >= state.config.emergencyTokens ? 400 : 300,
+		priority: rawTokens >= thresholds.emergencyTokens ? 400 : 300,
 		signal: controller.signal,
 	}, async (signal, waitedMs) => {
 		brokerSignal = signal;
@@ -406,6 +409,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 
 	pi.on("context", async (event, ctx) => {
 		if (!state) return;
+		const thresholds = resolveThresholds(state.config, ctx.model?.contextWindow);
 		const previousRequestProjected = state.stats.action.startsWith("project_");
 		const estimate = estimateContext(event.messages, state.config.fallbackOverheadTokens, {
 			lastRequestProjected: previousRequestProjected,
@@ -424,7 +428,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 		}
 
 		if (state.mode === "shadow") {
-			if (estimate.tokens >= state.config.prepareTokens) {
+			if (estimate.tokens >= thresholds.prepareTokens) {
 				const checkpoint = await deterministicCheckpoint(state, event.messages, estimate.tokens, ctx);
 				if (checkpoint) {
 					const projection = await createProjection(state, checkpoint, event.messages, estimate.overheadTokens, true);
@@ -464,7 +468,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 				rawTokens: estimate.tokens,
 				projectedTokens,
 				action: directState.stats.action,
-				targetMet: projectedTokens <= directState.config.targetTokens,
+				targetMet: projectedTokens <= thresholds.targetTokens,
 			};
 			directState.telemetry.write({
 				mode: directState.mode,
@@ -479,11 +483,11 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			return { messages: directInputProjection };
 		};
 
-		if (estimate.tokens >= state.config.prepareTokens && (!state.active || state.callsSinceActivation >= state.config.minCallsBetweenRefresh)) {
-			startSmartCheckpoint(state, event.messages, estimate.tokens, ctx);
+		if (estimate.tokens >= thresholds.prepareTokens && (!state.active || state.callsSinceActivation >= state.config.minCallsBetweenRefresh)) {
+			startSmartCheckpoint(state, event.messages, estimate.tokens, ctx, thresholds);
 		}
 
-		if (!state.active && estimate.tokens < state.config.swapTokens) {
+		if (!state.active && estimate.tokens < thresholds.swapTokens) {
 			if (directInputChanged) return useDirectInputProjection();
 			state.telemetry.write({ mode: state.mode, action: "pass", rawTokens: estimate.tokens, overheadTokens: estimate.overheadTokens, rawMessages: event.messages.length });
 			updateFooter(ctx, state);
@@ -526,7 +530,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			projection.projectedTokens,
 			state.config,
 			state.projectionCommitted,
-		) && estimate.tokens < state.config.emergencyTokens) {
+		) && estimate.tokens < thresholds.emergencyTokens) {
 			if (directInputChanged) return useDirectInputProjection();
 			state.stats.action = "insufficient_reduction";
 			state.stats.projectedTokens = projection.projectedTokens;
@@ -535,8 +539,8 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (projection.projectedTokens > state.config.targetTokens) {
-			const excessTokens = projection.projectedTokens - state.config.targetTokens;
+		if (projection.projectedTokens > thresholds.targetTokens) {
+			const excessTokens = projection.projectedTokens - thresholds.targetTokens;
 			const currentSummaryTokens = summaryTokenCount(checkpoint);
 			const minimumSummaryTokens = Math.min(1_000, currentSummaryTokens);
 			const tighterSummaryTokens = Math.max(
@@ -560,9 +564,9 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			const minimumTargetSummaryTokens = 1_000;
 			const maxRecentTokens = Math.max(
 				1,
-				state.config.targetTokens - estimate.overheadTokens - minimumTargetSummaryTokens,
+				thresholds.targetTokens - estimate.overheadTokens - minimumTargetSummaryTokens,
 			);
-			const targetCheckpoint = projection.projectedTokens > state.config.targetTokens
+			const targetCheckpoint = projection.projectedTokens > thresholds.targetTokens
 				? await deterministicCheckpoint(state, event.messages, estimate.tokens, ctx, {
 					maxRecentTokens,
 					maxSummaryTokens: minimumTargetSummaryTokens,
@@ -587,7 +591,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			rawTokens: estimate.tokens,
 			projectedTokens: projection.projectedTokens,
 			action: state.stats.action,
-			targetMet: projection.projectedTokens <= state.config.targetTokens,
+			targetMet: projection.projectedTokens <= thresholds.targetTokens,
 		};
 		state.telemetry.write({
 			mode: state.mode,
@@ -602,8 +606,8 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 				omittedMessages: projection.omittedMessages,
 				callsSinceActivation: state.callsSinceActivation,
 				continuedProjection,
-				targetTokens: state.config.targetTokens,
-				targetMet: projection.projectedTokens <= state.config.targetTokens,
+				targetTokens: thresholds.targetTokens,
+				targetMet: projection.projectedTokens <= thresholds.targetTokens,
 			},
 		});
 		updateFooter(ctx, state);
@@ -642,7 +646,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("vctx:status", {
 		description: "Show current context estimate, thresholds, and last projection",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(state ? statusText(state) : "pi-virtual-context has no active session state", state ? "info" : "warning");
+			ctx.ui.notify(state ? statusText(state, resolveThresholds(state.config, ctx.model?.contextWindow)) : "pi-virtual-context has no active session state", state ? "info" : "warning");
 		},
 	});
 

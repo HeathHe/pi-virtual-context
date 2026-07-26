@@ -1,5 +1,7 @@
 export type VirtualContextMode = "off" | "shadow" | "enabled";
 
+export type ThresholdsMode = "static" | "ratio";
+
 export interface SummaryModelConfig {
 	provider: string;
 	id: string;
@@ -8,10 +10,15 @@ export interface SummaryModelConfig {
 
 export interface VirtualContextConfig {
 	mode: VirtualContextMode;
+	thresholdsMode: ThresholdsMode;
 	prepareTokens: number;
 	swapTokens: number;
 	targetTokens: number;
 	emergencyTokens: number;
+	prepareRatio: number;
+	swapRatio: number;
+	targetRatio: number;
+	emergencyRatio: number;
 	keepRecentTokens: number;
 	fallbackOverheadTokens: number;
 	minReductionTokens: number;
@@ -37,10 +44,15 @@ export interface NormalizedConfig {
 
 export const DEFAULT_CONFIG: VirtualContextConfig = {
 	mode: "shadow",
+	thresholdsMode: "static",
 	prepareTokens: 80_000,
 	swapTokens: 95_000,
 	targetTokens: 65_000,
 	emergencyTokens: 120_000,
+	prepareRatio: 0.3,
+	swapRatio: 0.4,
+	targetRatio: 0.25,
+	emergencyRatio: 0.55,
 	keepRecentTokens: 12_000,
 	fallbackOverheadTokens: 50_000,
 	minReductionTokens: 30_000,
@@ -92,6 +104,12 @@ export function normalizeConfig(value: unknown): NormalizedConfig {
 		: DEFAULT_CONFIG.mode;
 	if (rawMode !== undefined && rawMode !== mode) warnings.push(`mode must be off, shadow, or enabled; using ${mode}`);
 
+	const rawThresholdsMode = input.thresholdsMode;
+	const thresholdsMode: ThresholdsMode = rawThresholdsMode === "ratio" || rawThresholdsMode === "static"
+		? rawThresholdsMode
+		: DEFAULT_CONFIG.thresholdsMode;
+	if (rawThresholdsMode !== undefined && rawThresholdsMode !== thresholdsMode) warnings.push(`thresholdsMode must be static or ratio; using ${thresholdsMode}`);
+
 	const rawSummaryModel = record(input.summaryModel);
 	const rawThinking = rawSummaryModel.thinking;
 	const thinking = typeof rawThinking === "string" && THINKING_LEVELS.has(rawThinking)
@@ -105,10 +123,15 @@ export function normalizeConfig(value: unknown): NormalizedConfig {
 
 	const config: VirtualContextConfig = {
 		mode,
+		thresholdsMode,
 		prepareTokens: positiveInteger(input.prepareTokens, DEFAULT_CONFIG.prepareTokens, "prepareTokens", warnings),
 		swapTokens: positiveInteger(input.swapTokens, DEFAULT_CONFIG.swapTokens, "swapTokens", warnings),
 		targetTokens: positiveInteger(input.targetTokens, DEFAULT_CONFIG.targetTokens, "targetTokens", warnings),
 		emergencyTokens: positiveInteger(input.emergencyTokens, DEFAULT_CONFIG.emergencyTokens, "emergencyTokens", warnings),
+		prepareRatio: ratio(input.prepareRatio, DEFAULT_CONFIG.prepareRatio, "prepareRatio", warnings),
+		swapRatio: ratio(input.swapRatio, DEFAULT_CONFIG.swapRatio, "swapRatio", warnings),
+		targetRatio: ratio(input.targetRatio, DEFAULT_CONFIG.targetRatio, "targetRatio", warnings),
+		emergencyRatio: ratio(input.emergencyRatio, DEFAULT_CONFIG.emergencyRatio, "emergencyRatio", warnings),
 		keepRecentTokens: positiveInteger(input.keepRecentTokens, DEFAULT_CONFIG.keepRecentTokens, "keepRecentTokens", warnings),
 		fallbackOverheadTokens: positiveInteger(input.fallbackOverheadTokens, DEFAULT_CONFIG.fallbackOverheadTokens, "fallbackOverheadTokens", warnings),
 		minReductionTokens: positiveInteger(input.minReductionTokens, DEFAULT_CONFIG.minReductionTokens, "minReductionTokens", warnings),
@@ -142,12 +165,52 @@ export function normalizeConfig(value: unknown): NormalizedConfig {
 		config.swapTokens = DEFAULT_CONFIG.swapTokens;
 		config.emergencyTokens = DEFAULT_CONFIG.emergencyTokens;
 	}
+	if (!(config.targetRatio < config.prepareRatio && config.prepareRatio < config.swapRatio && config.swapRatio < config.emergencyRatio)) {
+		warnings.push("ratio thresholds must satisfy target < prepare < swap < emergency; restored safe defaults");
+		config.targetRatio = DEFAULT_CONFIG.targetRatio;
+		config.prepareRatio = DEFAULT_CONFIG.prepareRatio;
+		config.swapRatio = DEFAULT_CONFIG.swapRatio;
+		config.emergencyRatio = DEFAULT_CONFIG.emergencyRatio;
+	}
 	if (config.keepRecentTokens >= config.targetTokens) {
 		warnings.push("keepRecentTokens must be below targetTokens; using the default");
 		config.keepRecentTokens = DEFAULT_CONFIG.keepRecentTokens;
 	}
 
 	return { config, warnings };
+}
+
+export interface ResolvedThresholds {
+	prepareTokens: number;
+	swapTokens: number;
+	targetTokens: number;
+	emergencyTokens: number;
+	source: "static" | "ratio";
+}
+
+/**
+ * Resolve the effective thresholds for the active model. In "ratio" mode the
+ * static token values act as the floor: ratio-scaled thresholds are used only
+ * when they exceed the static ones, so small-window models keep the tuned
+ * static behavior while large-window models (e.g. 1M) unlock their capacity.
+ */
+export function resolveThresholds(config: VirtualContextConfig, contextWindow: number | undefined): ResolvedThresholds {
+	const staticThresholds: ResolvedThresholds = {
+		prepareTokens: config.prepareTokens,
+		swapTokens: config.swapTokens,
+		targetTokens: config.targetTokens,
+		emergencyTokens: config.emergencyTokens,
+		source: "static",
+	};
+	if (config.thresholdsMode !== "ratio") return staticThresholds;
+	if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return staticThresholds;
+	return {
+		prepareTokens: Math.max(config.prepareTokens, Math.floor(contextWindow * config.prepareRatio)),
+		swapTokens: Math.max(config.swapTokens, Math.floor(contextWindow * config.swapRatio)),
+		targetTokens: Math.max(config.targetTokens, Math.floor(contextWindow * config.targetRatio)),
+		emergencyTokens: Math.max(config.emergencyTokens, Math.floor(contextWindow * config.emergencyRatio)),
+		source: "ratio",
+	};
 }
 
 export function mergeConfigValues(globalValue: unknown, projectValue: unknown): Record<string, unknown> {
