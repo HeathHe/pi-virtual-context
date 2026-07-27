@@ -44,9 +44,11 @@ It does not modify Pi core, global `node_modules`, or the session JSONL format.
 - Artifact directories use mode `0700`; files use mode `0600`.
 - Transient provider failures (including overload/rate-limit/429/5xx,
   network/timeout/context-length errors) and aborted requests retain the active
-  projection for Pi's retry. Unknown or structural provider errors discard the
-  projection and force one canonical fail-open request before projection may
-  resume. The classification decision is recorded in telemetry.
+  projection. When a failover chain is configured, retries exhausted by the
+  current provider advance to the next available provider/model and queue a
+  follow-up turn. Unknown or structural provider errors never fail over: they
+  discard the projection and force one canonical fail-open request before
+  projection may resume. The classification decision is recorded in telemetry.
 - Smart checkpoints share a process-level provider queue with observational-memory.
   Foreground agent work preempts the background lease; VCTX resumes only after
   `agent_end`, so summary generation cannot compete with the main response.
@@ -60,10 +62,62 @@ provider-admission gate, so it cannot claim a mathematical, all-code-path
 - `/vctx:status`
 - `/vctx:mode off|shadow|enabled` — runtime only
 - `/vctx:reset`
+- `/vctx:failback` — switch back to the model active before failover
 
 `/vctx:status` reports the current request estimate separately from the last
 projected request, so an old `raw → sent` result is not mistaken for the current
 context size.
+
+## Provider failover
+
+Failover is enabled by default but does nothing until a provider chain is
+configured. Chain keys are source provider names; targets are ordered
+`provider/modelId` strings:
+
+```json
+{
+  "virtual-context": {
+    "failover": {
+      "enabled": true,
+      "chains": {
+        "kimi-coding": ["ark/glm-5.2"]
+      },
+      "maxFailoversPerSession": 6
+    }
+  }
+}
+```
+
+Only transient failures after provider retries are exhausted activate a chain.
+Structural or unknown request errors never switch providers. If the active model
+is already a target in a chain, the next transient failure advances to the next
+entry; reaching the tail records `failover_exhausted` and leaves recovery to the
+user. Missing models and targets without an API key are skipped. The per-session
+cap prevents repeated follow-ups or provider ping-pong after the configured
+number of successful switches.
+
+A successful switch keeps the current VCTX projection and queues the literal
+`continue` as a follow-up turn, so threshold resolution and projection continue
+normally for the target model. `/vctx:failback` returns to the original model.
+
+In the currently supported Pi API, `pi.setModel()` also persists the selected
+model as the default. On session shutdown this extension attempts to restore the
+original model only if the active model is still the target selected by
+failover; a user's later manual model selection is never overwritten. Shutdown
+restore is bounded and best-effort, and `/vctx:failback` is the manual recovery
+path. If restore fails, the fallback model may remain the default for a later
+session and telemetry records `failback_failed`. The same applies when Pi exits
+non-gracefully (crash or kill) between failover and shutdown, because no
+`session_shutdown` handler runs in that case.
+
+Failover never triggers on user aborts (`stopReason: "aborted"`): cancelling a
+response keeps the projection but never switches the model or queues a
+follow-up.
+
+Implementation note: the installed extension API exposes model switching and
+follow-up delivery on `ExtensionAPI`, so the extension uses `pi.setModel()` and
+`pi.sendUserMessage("continue", { "deliverAs": "followUp" })`. It does not use
+the older `ctx.sendUserMessage` / `streamingBehavior` spelling.
 
 ## Threshold resolution and overrides
 
@@ -114,6 +168,13 @@ static/ratio behavior unchanged.
     "mode": "shadow",
     "thresholdsMode": "static",
     "thresholdOverrides": [],
+    "failover": {
+      "enabled": true,
+      "chains": {
+        "kimi-coding": ["ark/glm-5.2"]
+      },
+      "maxFailoversPerSession": 6
+    },
     "prepareTokens": 80000,
     "swapTokens": 95000,
     "targetTokens": 65000,

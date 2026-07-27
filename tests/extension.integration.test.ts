@@ -15,6 +15,7 @@ async function harness(options: {
 	model?: ExtensionContext["model"];
 	modelRegistry?: ExtensionContext["modelRegistry"];
 	config?: Record<string, unknown>;
+	setModel?: (model: NonNullable<ExtensionContext["model"]>) => boolean | Promise<boolean>;
 } = {}) {
 	const root = await mkdtemp(join(tmpdir(), "pi-vctx-extension-"));
 	await mkdir(root, { recursive: true });
@@ -44,6 +45,9 @@ async function harness(options: {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, CommandHandler>();
 	const notifications: string[] = [];
+	const setModelCalls: NonNullable<ExtensionContext["model"]>[] = [];
+	const userMessages: Array<{ content: unknown; options: unknown }> = [];
+	let ctx: ExtensionContext;
 	const pi = {
 		on(name: string, handler: Handler) {
 			const list = handlers.get(name) ?? [];
@@ -54,9 +58,24 @@ async function harness(options: {
 		registerCommand(name: string, command: { handler: CommandHandler }) {
 			commands.set(name, command.handler);
 		},
+		async setModel(model: NonNullable<ExtensionContext["model"]>) {
+			setModelCalls.push(model);
+			const switched = options.setModel ? await options.setModel(model) : true;
+			if (switched) {
+				const previousModel = ctx.model;
+				(ctx as { model: ExtensionContext["model"] }).model = model;
+				for (const handler of handlers.get("model_select") ?? []) {
+					await handler({ type: "model_select", model, previousModel, source: "set" }, ctx);
+				}
+			}
+			return switched;
+		},
+		sendUserMessage(content: unknown, messageOptions: unknown) {
+			userMessages.push({ content, options: messageOptions });
+		},
 	} as unknown as ExtensionAPI;
 	virtualContextExtension(pi);
-	const ctx = {
+	ctx = {
 		cwd: root,
 		hasUI: false,
 		ui: { setStatus() {}, notify(message: string) { notifications.push(message); } },
@@ -82,6 +101,9 @@ async function harness(options: {
 	return {
 		invoke,
 		notifications,
+		setModelCalls,
+		userMessages,
+		get model() { return ctx.model; },
 		async invokeCommand(name: string, args = "") {
 			return await commands.get(name)?.(args, ctx);
 		},
@@ -128,6 +150,13 @@ function projectableMessages(): AgentMessage[] {
 	];
 }
 
+function modelRegistry(...models: Array<{ provider: string; id: string; contextWindow?: number }>): ExtensionContext["modelRegistry"] {
+	return {
+		find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+		getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
+	} as unknown as ExtensionContext["modelRegistry"];
+}
+
 test("large input remains canonical at input time and is virtualized only for provider context", async () => {
 	const h = await harness();
 	try {
@@ -151,8 +180,13 @@ test("large input remains canonical at input time and is virtualized only for pr
 	}
 });
 
-test("a 429 provider error preserves the active projection and records a transient decision", async () => {
-	const h = await harness({ config: { debugLog: true } });
+test("a 429 provider error fails over, queues a follow-up, and preserves the active projection", async () => {
+	const ark = { provider: "ark", id: "glm-5.2", contextWindow: 256_000 };
+	const h = await harness({
+		model: { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 } as ExtensionContext["model"],
+		modelRegistry: modelRegistry(ark),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
 	try {
 		const messages = projectableMessages();
 		const projected = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
@@ -164,6 +198,9 @@ test("a 429 provider error preserves the active projection and records a transie
 			messages: [...messages, assistant("provider failed", "error", `HTTP 429 too many requests ${"x".repeat(250)}`)],
 		});
 		assert.equal(getBackgroundBroker().snapshot().foregroundActive, false);
+		assert.deepEqual(h.setModelCalls.map((model) => `${model.provider}/${model.id}`), ["ark/glm-5.2"]);
+		assert.deepEqual(h.userMessages, [{ content: "continue", options: { deliverAs: "followUp" } }]);
+		assert.match(h.notifications.at(-1) ?? "", /kimi-coding\/kimi-k2 限流，已切换到 ark\/glm-5\.2 完成本轮/);
 
 		const retry = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
 		assert.ok(retry?.messages?.some((message) => message.role === "compactionSummary"));
@@ -171,20 +208,30 @@ test("a 429 provider error preserves the active projection and records a transie
 		const decision = records.find((record) => record.action === "provider_transient_error");
 		assert.equal(decision?.details?.stopReason, "error");
 		assert.equal(decision?.details?.errorMessage, "[omitted-untrusted-text]");
+		assert.ok(records.some((record) => record.action === "failover_activated"
+			&& record.details?.from === "kimi-coding/kimi-k2"
+			&& record.details?.to === "ark/glm-5.2"));
 		assert.equal(records.some((record) => record.action === "fail_open_after_provider_failure"), false);
 	} finally {
 		await h.close();
 	}
 });
 
-test("an aborted provider request preserves the active projection", async () => {
-	const h = await harness();
+test("an aborted provider request preserves the active projection without failover", async () => {
+	const h = await harness({
+		model: { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 } as ExtensionContext["model"],
+		modelRegistry: modelRegistry({ provider: "ark", id: "glm-5.2" }),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
 	try {
 		const messages = projectableMessages();
 		const projected = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
 		assert.ok(projected?.messages?.some((message) => message.role === "compactionSummary"));
 
 		await h.invoke("agent_end", { messages: [...messages, assistant("aborted", "aborted")] });
+		// User aborts must never trigger a model switch or auto-continue.
+		assert.deepEqual(h.setModelCalls, []);
+		assert.deepEqual(h.userMessages, []);
 		const retry = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
 		assert.ok(retry?.messages?.some((message) => message.role === "compactionSummary"));
 	} finally {
@@ -192,8 +239,12 @@ test("an aborted provider request preserves the active projection", async () => 
 	}
 });
 
-test("a structural provider error clears the projection and fails open once", async () => {
-	const h = await harness({ config: { debugLog: true } });
+test("a structural provider error clears the projection and fails open once without failover", async () => {
+	const h = await harness({
+		model: { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 } as ExtensionContext["model"],
+		modelRegistry: modelRegistry({ provider: "ark", id: "glm-5.2" }),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
 	try {
 		const messages = projectableMessages();
 		const projected = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
@@ -209,6 +260,135 @@ test("a structural provider error clears the projection and fails open once", as
 		const records = await h.readTelemetry();
 		assert.ok(records.some((record) => record.action === "provider_failure_reset" && record.details?.stopReason === "error"));
 		assert.equal(records.filter((record) => record.action === "fail_open_after_provider_failure").length, 1);
+		assert.deepEqual(h.setModelCalls, []);
+		assert.deepEqual(h.userMessages, []);
+	} finally {
+		await h.close();
+	}
+});
+
+test("a transient error at the chain tail records exhaustion without a follow-up", async () => {
+	const h = await harness({
+		model: { provider: "ark", id: "glm-5.2", contextWindow: 256_000 } as ExtensionContext["model"],
+		modelRegistry: modelRegistry({ provider: "ark", id: "glm-5.2" }),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
+	try {
+		await h.invoke("agent_end", { messages: [assistant("failed", "error", "HTTP 429")] });
+		assert.deepEqual(h.setModelCalls, []);
+		assert.deepEqual(h.userMessages, []);
+		assert.match(h.notifications.at(-1) ?? "", /故障转移链已耗尽/);
+		const records = await h.readTelemetry();
+		assert.ok(records.some((record) => record.action === "failover_exhausted"));
+	} finally {
+		await h.close();
+	}
+});
+
+test("the per-session failover cap prevents another switch or follow-up", async () => {
+	const ark = { provider: "ark", id: "glm-5.2", contextWindow: 256_000 };
+	const next = { provider: "openai", id: "gpt-next", contextWindow: 128_000 };
+	const h = await harness({
+		model: { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 } as ExtensionContext["model"],
+		modelRegistry: modelRegistry(ark, next),
+		config: {
+			debugLog: true,
+			failover: { chains: { "kimi-coding": ["ark/glm-5.2", "openai/gpt-next"] }, maxFailoversPerSession: 1 },
+		},
+	});
+	try {
+		await h.invoke("agent_end", { messages: [assistant("failed", "error", "HTTP 429")] });
+		await h.invoke("agent_end", { messages: [assistant("failed again", "error", "overloaded")] });
+		assert.deepEqual(h.setModelCalls.map((model) => `${model.provider}/${model.id}`), ["ark/glm-5.2"]);
+		assert.equal(h.userMessages.length, 1);
+		const records = await h.readTelemetry();
+		assert.ok(records.some((record) => record.action === "failover_cap_reached"));
+	} finally {
+		await h.close();
+	}
+});
+
+test("a target without an API key is skipped in favor of the next chain entry", async () => {
+	const ark = { provider: "ark", id: "glm-5.2", contextWindow: 256_000 };
+	const next = { provider: "openai", id: "gpt-next", contextWindow: 128_000 };
+	const h = await harness({
+		model: { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 } as ExtensionContext["model"],
+		modelRegistry: modelRegistry(ark, next),
+		config: {
+			debugLog: true,
+			failover: { chains: { "kimi-coding": ["ark/glm-5.2", "openai/gpt-next"] } },
+		},
+		setModel: (model) => model.provider !== "ark",
+	});
+	try {
+		await h.invoke("agent_end", { messages: [assistant("failed", "error", "too many requests")] });
+		assert.deepEqual(h.setModelCalls.map((model) => `${model.provider}/${model.id}`), ["ark/glm-5.2", "openai/gpt-next"]);
+		assert.equal(h.model?.provider, "openai");
+		assert.deepEqual(h.userMessages, [{ content: "continue", options: { deliverAs: "followUp" } }]);
+		const records = await h.readTelemetry();
+		assert.ok(records.some((record) => record.action === "failover_activated" && record.details?.to === "openai/gpt-next"));
+	} finally {
+		await h.close();
+	}
+});
+
+test("vctx failback returns to the original model and records telemetry", async () => {
+	const kimi = { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 };
+	const ark = { provider: "ark", id: "glm-5.2", contextWindow: 256_000 };
+	const h = await harness({
+		model: kimi as ExtensionContext["model"],
+		modelRegistry: modelRegistry(kimi, ark),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
+	try {
+		await h.invoke("agent_end", { messages: [assistant("failed", "error", "HTTP 429")] });
+		await h.invokeCommand("vctx:failback");
+		assert.deepEqual(h.setModelCalls.map((model) => `${model.provider}/${model.id}`), ["ark/glm-5.2", "kimi-coding/kimi-k2"]);
+		assert.equal(h.model?.provider, "kimi-coding");
+		assert.match(h.notifications.at(-1) ?? "", /已切回 kimi-coding\/kimi-k2/);
+		const records = await h.readTelemetry();
+		assert.ok(records.some((record) => record.action === "failback"
+			&& record.details?.from === "ark/glm-5.2"
+			&& record.details?.to === "kimi-coding/kimi-k2"));
+	} finally {
+		await h.close();
+	}
+});
+
+test("session shutdown restores the persisted default only while still on the failover target", async () => {
+	const kimi = { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 };
+	const ark = { provider: "ark", id: "glm-5.2", contextWindow: 256_000 };
+	const h = await harness({
+		model: kimi as ExtensionContext["model"],
+		modelRegistry: modelRegistry(kimi, ark),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
+	try {
+		await h.invoke("agent_end", { messages: [assistant("failed", "error", "HTTP 429")] });
+		await h.invoke("session_shutdown");
+		assert.deepEqual(h.setModelCalls.map((model) => `${model.provider}/${model.id}`), ["ark/glm-5.2", "kimi-coding/kimi-k2"]);
+		assert.equal(h.model?.provider, "kimi-coding");
+		const records = await h.readTelemetry();
+		assert.ok(records.some((record) => record.action === "failback" && record.details?.reason === "session_shutdown"));
+	} finally {
+		await h.close();
+	}
+});
+
+test("session shutdown does not overwrite a model selected manually after failover", async () => {
+	const kimi = { provider: "kimi-coding", id: "kimi-k2", contextWindow: 128_000 };
+	const ark = { provider: "ark", id: "glm-5.2", contextWindow: 256_000 };
+	const manual = { provider: "openai", id: "gpt-manual", contextWindow: 128_000 };
+	const h = await harness({
+		model: kimi as ExtensionContext["model"],
+		modelRegistry: modelRegistry(kimi, ark, manual),
+		config: { debugLog: true, failover: { chains: { "kimi-coding": ["ark/glm-5.2"] } } },
+	});
+	try {
+		await h.invoke("agent_end", { messages: [assistant("failed", "error", "HTTP 429")] });
+		await h.invoke("model_select", { model: manual, previousModel: ark, source: "set" });
+		await h.invoke("session_shutdown");
+		assert.deepEqual(h.setModelCalls.map((model) => `${model.provider}/${model.id}`), ["ark/glm-5.2"]);
 	} finally {
 		await h.close();
 	}
