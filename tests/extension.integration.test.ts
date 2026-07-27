@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import virtualContextExtension from "../extensions/pi-virtual-context.ts";
+import { getBackgroundBroker } from "../src/background-broker.ts";
 
 type Handler = (event: any, ctx: ExtensionContext) => unknown | Promise<unknown>;
+type CommandHandler = (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>;
 
 async function harness(options: {
 	model?: ExtensionContext["model"];
 	modelRegistry?: ExtensionContext["modelRegistry"];
+	config?: Record<string, unknown>;
 } = {}) {
 	const root = await mkdtemp(join(tmpdir(), "pi-vctx-extension-"));
 	await mkdir(root, { recursive: true });
@@ -32,12 +35,15 @@ async function harness(options: {
 			minCallsBetweenRefresh: 1,
 			maxSingleInputTokens: 10,
 			debugLog: false,
+			...options.config,
 		},
 	}), "utf8");
 	const previous = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = root;
 
 	const handlers = new Map<string, Handler[]>();
+	const commands = new Map<string, CommandHandler>();
+	const notifications: string[] = [];
 	const pi = {
 		on(name: string, handler: Handler) {
 			const list = handlers.get(name) ?? [];
@@ -45,18 +51,20 @@ async function harness(options: {
 			handlers.set(name, list);
 		},
 		events: { on: () => () => undefined, emit() {} },
-		registerCommand() {},
+		registerCommand(name: string, command: { handler: CommandHandler }) {
+			commands.set(name, command.handler);
+		},
 	} as unknown as ExtensionAPI;
 	virtualContextExtension(pi);
 	const ctx = {
 		cwd: root,
 		hasUI: false,
-		ui: { setStatus() {}, notify() {} },
+		ui: { setStatus() {}, notify(message: string) { notifications.push(message); } },
 		sessionManager: {
 			getSessionId: () => "integration-session",
 			getSessionFile: () => join(root, "session.jsonl"),
 		},
-		model: options.model ?? { provider: "test", contextWindow: 10_000 },
+		model: options.model ?? { provider: "test", id: "test", contextWindow: 10_000 },
 		modelRegistry: options.modelRegistry ?? {
 			find: () => undefined,
 			getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
@@ -73,8 +81,24 @@ async function harness(options: {
 	await invoke("session_start");
 	return {
 		invoke,
+		notifications,
+		async invokeCommand(name: string, args = "") {
+			return await commands.get(name)?.(args, ctx);
+		},
+		async readTelemetry(): Promise<any[]> {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			const telemetryRoot = join(root, "virtual-context", "telemetry");
+			const files = await readdir(telemetryRoot);
+			const records: any[] = [];
+			for (const file of files.filter((name) => name.endsWith(".jsonl"))) {
+				const text = await readFile(join(telemetryRoot, file), "utf8");
+				records.push(...text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+			}
+			return records;
+		},
 		async close() {
 			await invoke("session_shutdown");
+			await new Promise((resolve) => setTimeout(resolve, 20));
 			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previous;
 			await rm(root, { recursive: true, force: true });
@@ -82,7 +106,7 @@ async function harness(options: {
 	};
 }
 
-function assistant(text: string, stopReason: "stop" | "error" | "aborted" = "stop"): AgentMessage {
+function assistant(text: string, stopReason: "stop" | "error" | "aborted" = "stop", errorMessage?: string): AgentMessage {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -91,8 +115,17 @@ function assistant(text: string, stopReason: "stop" | "error" | "aborted" = "sto
 		model: "test",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		stopReason,
+		...(errorMessage === undefined ? {} : { errorMessage }),
 		timestamp: Date.now(),
 	} as AgentMessage;
+}
+
+function projectableMessages(): AgentMessage[] {
+	return [
+		{ role: "user", content: "old ".repeat(800), timestamp: 1 } as AgentMessage,
+		assistant("recent ".repeat(80)),
+		{ role: "user", content: "new request", timestamp: 3 } as AgentMessage,
+	];
 }
 
 test("large input remains canonical at input time and is virtualized only for provider context", async () => {
@@ -118,19 +151,86 @@ test("large input remains canonical at input time and is virtualized only for pr
 	}
 });
 
-test("provider failure clears a committed projection and fails open once", async () => {
-	const h = await harness();
+test("a 429 provider error preserves the active projection and records a transient decision", async () => {
+	const h = await harness({ config: { debugLog: true } });
 	try {
-		const messages = [
-			{ role: "user", content: "old ".repeat(800), timestamp: 1 } as AgentMessage,
-			assistant("recent ".repeat(80)),
-			{ role: "user", content: "new request", timestamp: 3 } as AgentMessage,
-		];
+		const messages = projectableMessages();
 		const projected = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
 		assert.ok(projected?.messages?.some((message) => message.role === "compactionSummary"));
 
-		await h.invoke("agent_end", { messages: [...messages, assistant("provider failed", "error")] });
+		await h.invoke("agent_start");
+		assert.equal(getBackgroundBroker().snapshot().foregroundActive, true);
+		await h.invoke("agent_end", {
+			messages: [...messages, assistant("provider failed", "error", `HTTP 429 too many requests ${"x".repeat(250)}`)],
+		});
+		assert.equal(getBackgroundBroker().snapshot().foregroundActive, false);
+
+		const retry = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
+		assert.ok(retry?.messages?.some((message) => message.role === "compactionSummary"));
+		const records = await h.readTelemetry();
+		const decision = records.find((record) => record.action === "provider_transient_error");
+		assert.equal(decision?.details?.stopReason, "error");
+		assert.equal(decision?.details?.errorMessage, "[omitted-untrusted-text]");
+		assert.equal(records.some((record) => record.action === "fail_open_after_provider_failure"), false);
+	} finally {
+		await h.close();
+	}
+});
+
+test("an aborted provider request preserves the active projection", async () => {
+	const h = await harness();
+	try {
+		const messages = projectableMessages();
+		const projected = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
+		assert.ok(projected?.messages?.some((message) => message.role === "compactionSummary"));
+
+		await h.invoke("agent_end", { messages: [...messages, assistant("aborted", "aborted")] });
+		const retry = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
+		assert.ok(retry?.messages?.some((message) => message.role === "compactionSummary"));
+	} finally {
+		await h.close();
+	}
+});
+
+test("a structural provider error clears the projection and fails open once", async () => {
+	const h = await harness({ config: { debugLog: true } });
+	try {
+		const messages = projectableMessages();
+		const projected = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
+		assert.ok(projected?.messages?.some((message) => message.role === "compactionSummary"));
+
+		await h.invoke("agent_end", {
+			messages: [...messages, assistant("provider failed", "error", "invalid message format")],
+		});
 		assert.equal(await h.invoke("context", { messages }), undefined);
+		const resumed = await h.invoke("context", { messages }) as { messages?: AgentMessage[] } | undefined;
+		assert.ok(resumed?.messages?.some((message) => message.role === "compactionSummary"));
+
+		const records = await h.readTelemetry();
+		assert.ok(records.some((record) => record.action === "provider_failure_reset" && record.details?.stopReason === "error"));
+		assert.equal(records.filter((record) => record.action === "fail_open_after_provider_failure").length, 1);
+	} finally {
+		await h.close();
+	}
+});
+
+test("vctx status reports provider-and-model threshold overrides", async () => {
+	const h = await harness({
+		model: { provider: "kimi-coding", id: "kimi-k2", contextWindow: 1_000_000 } as ExtensionContext["model"],
+		config: {
+			thresholdOverrides: [{
+				provider: "kimi-coding",
+				model: "kimi-k2",
+				prepareTokens: 60,
+				swapTokens: 80,
+				targetTokens: 40,
+				emergencyTokens: 100,
+			}],
+		},
+	});
+	try {
+		await h.invokeCommand("vctx:status");
+		assert.match(h.notifications[h.notifications.length - 1] ?? "", /Thresholds \(override\): prepare 60 \/ swap 80 \/ target 40 \/ emergency 100/);
 	} finally {
 		await h.close();
 	}

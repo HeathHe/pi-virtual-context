@@ -8,9 +8,19 @@ export interface SummaryModelConfig {
 	thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 }
 
+export interface ThresholdOverride {
+	provider?: string;
+	model?: string;
+	prepareTokens: number;
+	swapTokens: number;
+	targetTokens: number;
+	emergencyTokens: number;
+}
+
 export interface VirtualContextConfig {
 	mode: VirtualContextMode;
 	thresholdsMode: ThresholdsMode;
+	thresholdOverrides: ThresholdOverride[];
 	prepareTokens: number;
 	swapTokens: number;
 	targetTokens: number;
@@ -45,6 +55,7 @@ export interface NormalizedConfig {
 export const DEFAULT_CONFIG: VirtualContextConfig = {
 	mode: "shadow",
 	thresholdsMode: "static",
+	thresholdOverrides: [],
 	prepareTokens: 80_000,
 	swapTokens: 95_000,
 	targetTokens: 65_000,
@@ -95,6 +106,63 @@ function ratio(value: unknown, fallback: number, name: string, warnings: string[
 	return fallback;
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function positiveIntegerOrUndefined(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function normalizeThresholdOverrides(value: unknown, warnings: string[]): ThresholdOverride[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) {
+		warnings.push("thresholdOverrides must be an array; ignoring it");
+		return [];
+	}
+
+	const overrides: ThresholdOverride[] = [];
+	const selectors = new Set<string>();
+	for (const [index, item] of value.entries()) {
+		const input = record(item);
+		const provider = nonEmptyString(input.provider);
+		const model = nonEmptyString(input.model);
+		if (!provider && !model) {
+			warnings.push(`thresholdOverrides[${index}] must specify a non-empty provider or model; ignoring it`);
+			continue;
+		}
+
+		const prepareTokens = positiveIntegerOrUndefined(input.prepareTokens);
+		const swapTokens = positiveIntegerOrUndefined(input.swapTokens);
+		const targetTokens = positiveIntegerOrUndefined(input.targetTokens);
+		const emergencyTokens = positiveIntegerOrUndefined(input.emergencyTokens);
+		if (prepareTokens === undefined || swapTokens === undefined || targetTokens === undefined || emergencyTokens === undefined) {
+			warnings.push(`thresholdOverrides[${index}] must provide four positive integer thresholds; ignoring it`);
+			continue;
+		}
+		if (!(targetTokens < prepareTokens && prepareTokens < swapTokens && swapTokens < emergencyTokens)) {
+			warnings.push(`thresholdOverrides[${index}] thresholds must satisfy target < prepare < swap < emergency; ignoring it`);
+			continue;
+		}
+
+		const selectorKey = JSON.stringify([provider, model]);
+		if (selectors.has(selectorKey)) {
+			warnings.push(`thresholdOverrides[${index}] duplicates an earlier provider/model selector; ignoring it`);
+			continue;
+		}
+		selectors.add(selectorKey);
+		overrides.push({
+			...(provider ? { provider } : {}),
+			...(model ? { model } : {}),
+			prepareTokens,
+			swapTokens,
+			targetTokens,
+			emergencyTokens,
+		});
+	}
+	return overrides;
+}
+
 export function normalizeConfig(value: unknown): NormalizedConfig {
 	const input = record(value);
 	const warnings: string[] = [];
@@ -124,6 +192,7 @@ export function normalizeConfig(value: unknown): NormalizedConfig {
 	const config: VirtualContextConfig = {
 		mode,
 		thresholdsMode,
+		thresholdOverrides: normalizeThresholdOverrides(input.thresholdOverrides, warnings),
 		prepareTokens: positiveInteger(input.prepareTokens, DEFAULT_CONFIG.prepareTokens, "prepareTokens", warnings),
 		swapTokens: positiveInteger(input.swapTokens, DEFAULT_CONFIG.swapTokens, "swapTokens", warnings),
 		targetTokens: positiveInteger(input.targetTokens, DEFAULT_CONFIG.targetTokens, "targetTokens", warnings),
@@ -185,16 +254,41 @@ export interface ResolvedThresholds {
 	swapTokens: number;
 	targetTokens: number;
 	emergencyTokens: number;
-	source: "static" | "ratio";
+	source: "static" | "ratio" | "override";
 }
 
 /**
- * Resolve the effective thresholds for the active model. In "ratio" mode the
- * static token values act as the floor: ratio-scaled thresholds are used only
- * when they exceed the static ones, so small-window models keep the tuned
- * static behavior while large-window models (e.g. 1M) unlock their capacity.
+ * Resolve the effective thresholds for the active model. A provider+model
+ * override takes precedence over a single-field selector, with the first entry
+ * winning within the same specificity. Without a match, ratio mode keeps the
+ * static token values as the floor.
  */
-export function resolveThresholds(config: VirtualContextConfig, contextWindow: number | undefined): ResolvedThresholds {
+export function resolveThresholds(
+	config: VirtualContextConfig,
+	contextWindow: number | undefined,
+	model?: { provider?: string; id?: string },
+): ResolvedThresholds {
+	let matchedOverride: ThresholdOverride | undefined;
+	let matchedSpecificity = 0;
+	for (const override of config.thresholdOverrides ?? []) {
+		if (override.provider !== undefined && override.provider !== model?.provider) continue;
+		if (override.model !== undefined && override.model !== model?.id) continue;
+		const specificity = Number(override.provider !== undefined) + Number(override.model !== undefined);
+		if (specificity > matchedSpecificity) {
+			matchedOverride = override;
+			matchedSpecificity = specificity;
+		}
+	}
+	if (matchedOverride) {
+		return {
+			prepareTokens: matchedOverride.prepareTokens,
+			swapTokens: matchedOverride.swapTokens,
+			targetTokens: matchedOverride.targetTokens,
+			emergencyTokens: matchedOverride.emergencyTokens,
+			source: "override",
+		};
+	}
+
 	const staticThresholds: ResolvedThresholds = {
 		prepareTokens: config.prepareTokens,
 		swapTokens: config.swapTokens,

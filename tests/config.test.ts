@@ -80,3 +80,101 @@ test("static mode ignores the context window", () => {
 	assert.equal(resolved.source, "static");
 	assert.equal(resolved.prepareTokens, DEFAULT_CONFIG.prepareTokens);
 });
+
+const VALID_OVERRIDE = {
+	provider: "kimi-coding",
+	prepareTokens: 60_000,
+	swapTokens: 75_000,
+	targetTokens: 45_000,
+	emergencyTokens: 90_000,
+};
+
+test("normalizes a complete threshold override", () => {
+	const { config, warnings } = normalizeConfig({ thresholdOverrides: [VALID_OVERRIDE] });
+	assert.deepEqual(config.thresholdOverrides, [VALID_OVERRIDE]);
+	assert.deepEqual(warnings, []);
+});
+
+test("rejects a threshold override without a selector", () => {
+	const { config, warnings } = normalizeConfig({
+		thresholdOverrides: [{ ...VALID_OVERRIDE, provider: undefined }],
+	});
+	assert.deepEqual(config.thresholdOverrides, []);
+	assert.ok(warnings.some((warning) => warning.includes("provider or model")));
+});
+
+test("rejects a threshold override with a missing or non-integer threshold", () => {
+	const missing = { ...VALID_OVERRIDE } as Record<string, unknown>;
+	delete missing.emergencyTokens;
+	const { config, warnings } = normalizeConfig({
+		thresholdOverrides: [missing, { ...VALID_OVERRIDE, provider: "other", swapTokens: 75_000.5 }],
+	});
+	assert.deepEqual(config.thresholdOverrides, []);
+	assert.equal(warnings.filter((warning) => warning.includes("four positive integer thresholds")).length, 2);
+});
+
+test("rejects an incorrectly ordered threshold override", () => {
+	const { config, warnings } = normalizeConfig({
+		thresholdOverrides: [{ ...VALID_OVERRIDE, targetTokens: 70_000 }],
+	});
+	assert.deepEqual(config.thresholdOverrides, []);
+	assert.ok(warnings.some((warning) => warning.includes("target < prepare")));
+});
+
+test("keeps the first duplicate threshold override selector and warns", () => {
+	const { config, warnings } = normalizeConfig({
+		thresholdOverrides: [VALID_OVERRIDE, { ...VALID_OVERRIDE, prepareTokens: 65_000 }],
+	});
+	assert.deepEqual(config.thresholdOverrides, [VALID_OVERRIDE]);
+	assert.ok(warnings.some((warning) => warning.includes("duplicates")));
+});
+
+test("resolves a provider-only threshold override", () => {
+	const { config } = normalizeConfig({ thresholdOverrides: [VALID_OVERRIDE] });
+	const resolved = resolveThresholds(config, 1_000_000, { provider: "kimi-coding", id: "kimi-k2" });
+	assert.equal(resolved.source, "override");
+	assert.equal(resolved.prepareTokens, VALID_OVERRIDE.prepareTokens);
+	assert.equal(resolved.targetTokens, VALID_OVERRIDE.targetTokens);
+});
+
+test("a provider-and-model threshold override takes precedence over a provider-only match", () => {
+	const exact = {
+		provider: "kimi-coding",
+		model: "kimi-k2",
+		prepareTokens: 50_000,
+		swapTokens: 65_000,
+		targetTokens: 40_000,
+		emergencyTokens: 80_000,
+	};
+	const { config } = normalizeConfig({ thresholdOverrides: [VALID_OVERRIDE, exact] });
+	const resolved = resolveThresholds(config, 1_000_000, { provider: "kimi-coding", id: "kimi-k2" });
+	assert.equal(resolved.source, "override");
+	assert.equal(resolved.prepareTokens, exact.prepareTokens);
+});
+
+test("uses the first matching threshold override at the same specificity", () => {
+	const first = { ...VALID_OVERRIDE, provider: undefined, model: "kimi-k2" };
+	const second = { ...VALID_OVERRIDE, provider: undefined, model: "kimi-k2", prepareTokens: 65_000 };
+	const config = { ...DEFAULT_CONFIG, thresholdOverrides: [first, second] };
+	const resolved = resolveThresholds(config, 1_000_000, { provider: "kimi-coding", id: "kimi-k2" });
+	assert.equal(resolved.prepareTokens, first.prepareTokens);
+});
+
+test("unmatched threshold overrides retain base ratio and static resolution", () => {
+	const ratioConfig = normalizeConfig({ thresholdsMode: "ratio", thresholdOverrides: [VALID_OVERRIDE] }).config;
+	assert.equal(resolveThresholds(ratioConfig, 1_000_000, { provider: "other", id: "model" }).source, "ratio");
+	assert.equal(resolveThresholds(ratioConfig, 1_000_000, { provider: "other", id: "model" }).prepareTokens, 300_000);
+
+	const staticConfig = normalizeConfig({ thresholdOverrides: [VALID_OVERRIDE] }).config;
+	assert.equal(resolveThresholds(staticConfig, 1_000_000, { provider: "other", id: "model" }).source, "static");
+	assert.equal(resolveThresholds(staticConfig, 1_000_000, { provider: "other", id: "model" }).prepareTokens, DEFAULT_CONFIG.prepareTokens);
+});
+
+test("project thresholdOverrides replace the global override table", () => {
+	const projectOverrides = [{ ...VALID_OVERRIDE, provider: "project-provider" }];
+	const merged = mergeConfigValues(
+		{ thresholdOverrides: [VALID_OVERRIDE] },
+		{ thresholdOverrides: projectOverrides },
+	);
+	assert.deepEqual(merged.thresholdOverrides, projectOverrides);
+});

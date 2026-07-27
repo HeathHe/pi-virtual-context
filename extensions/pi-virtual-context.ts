@@ -118,6 +118,10 @@ function statusBar(ratio: number): string {
 	return "█".repeat(filled) + "░".repeat(STATUS_BAR_WIDTH - filled);
 }
 
+function activeThresholdModel(ctx: ExtensionContext): { provider?: string; id?: string } | undefined {
+	return ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+}
+
 function updateFooter(ctx: ExtensionContext, state: RuntimeState): void {
 	if (state.mode === "off") {
 		ctx.ui.setStatus("virtual-context", undefined);
@@ -127,7 +131,7 @@ function updateFooter(ctx: ExtensionContext, state: RuntimeState): void {
 	const fg = theme?.fg?.bind(theme) ?? ((_color: string, text: string) => text);
 	const rawK = Math.round(state.stats.rawTokens / 1000);
 	const prefix = state.mode === "shadow" ? "◈ shadow " : "◈ ";
-	const thresholds = resolveThresholds(state.config, ctx.model?.contextWindow);
+	const thresholds = resolveThresholds(state.config, ctx.model?.contextWindow, activeThresholdModel(ctx));
 	const bar = statusBar(state.stats.rawTokens / thresholds.swapTokens);
 	if (state.stats.projectedTokens === undefined) {
 		ctx.ui.setStatus("virtual-context", fg("dim", `${prefix}${bar} ~${rawK}K ${state.stats.action}`));
@@ -144,6 +148,13 @@ function updateFooter(ctx: ExtensionContext, state: RuntimeState): void {
 				? "accent"
 				: "dim";
 	ctx.ui.setStatus("virtual-context", fg(color, text));
+}
+
+const TRANSIENT_PROVIDER_ERROR_RE = /(?:overloaded|rate[\s_-]*limit|too many requests|\b429\b|\b5(?:\d{2}|xx)\b|service unavailable|\bnetwork\b|\bconnection\b|\beconn(?:reset|refused|aborted)\b|socket hang up|\btimeouts?\b|\btimed?\s*out\b|context.?length)/i;
+
+function providerErrorMessage(message: AgentMessage): string {
+	const errorMessage = (message as { errorMessage?: unknown }).errorMessage;
+	return typeof errorMessage === "string" ? errorMessage : "";
 }
 
 function cancelPending(state: RuntimeState, reason: string): void {
@@ -438,7 +449,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 
 	pi.on("context", async (event, ctx) => {
 		if (!state) return;
-		const thresholds = resolveThresholds(state.config, ctx.model?.contextWindow);
+		const thresholds = resolveThresholds(state.config, ctx.model?.contextWindow, activeThresholdModel(ctx));
 		const previousRequestProjected = state.stats.action.startsWith("project_");
 		const estimate = estimateContext(event.messages, state.config.fallbackOverheadTokens, {
 			lastRequestProjected: previousRequestProjected,
@@ -644,18 +655,24 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", (event) => {
+		getBackgroundBroker().setForegroundActive(false);
 		const lastAssistant = [...event.messages].reverse().find((message: AgentMessage) => message.role === "assistant");
-		if (lastAssistant?.role === "assistant" && (lastAssistant.stopReason === "error" || lastAssistant.stopReason === "aborted")) {
-			if (!state) return;
-			cancelPending(state, `provider_${lastAssistant.stopReason}`);
-			state.active = undefined;
-			state.callsSinceActivation = 0;
-			state.projectionCommitted = false;
-			state.failOpenRequests = 1;
-			state.telemetry.write({ mode: state.mode, action: "provider_failure_reset", details: { stopReason: lastAssistant.stopReason } });
+		if (lastAssistant?.role !== "assistant" || (lastAssistant.stopReason !== "error" && lastAssistant.stopReason !== "aborted") || !state) return;
+
+		const errorMessage = providerErrorMessage(lastAssistant);
+		const details = { stopReason: lastAssistant.stopReason, errorMessage: errorMessage.slice(0, 200) };
+		const transient = lastAssistant.stopReason === "aborted" || TRANSIENT_PROVIDER_ERROR_RE.test(errorMessage);
+		if (transient) {
+			state.telemetry.write({ mode: state.mode, action: "provider_transient_error", details });
 			return;
 		}
-		getBackgroundBroker().setForegroundActive(false);
+
+		cancelPending(state, `provider_${lastAssistant.stopReason}`);
+		state.active = undefined;
+		state.callsSinceActivation = 0;
+		state.projectionCommitted = false;
+		state.failOpenRequests = 1;
+		state.telemetry.write({ mode: state.mode, action: "provider_failure_reset", details });
 	});
 
 	pi.on("session_before_compact", () => invalidate(state, "session_before_compact"));
@@ -675,7 +692,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("vctx:status", {
 		description: "Show current context estimate, thresholds, and last projection",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(state ? statusText(state, resolveThresholds(state.config, ctx.model?.contextWindow)) : "pi-virtual-context has no active session state", state ? "info" : "warning");
+			ctx.ui.notify(state ? statusText(state, resolveThresholds(state.config, ctx.model?.contextWindow, activeThresholdModel(ctx))) : "pi-virtual-context has no active session state", state ? "info" : "warning");
 		},
 	});
 
