@@ -111,11 +111,39 @@ function statusText(state: RuntimeState, thresholds: ResolvedThresholds): string
 	].join("\n");
 }
 
+const STATUS_BAR_WIDTH = 10;
+
+function statusBar(ratio: number): string {
+	const filled = Math.max(0, Math.min(STATUS_BAR_WIDTH, Math.round(ratio * STATUS_BAR_WIDTH)));
+	return "█".repeat(filled) + "░".repeat(STATUS_BAR_WIDTH - filled);
+}
+
 function updateFooter(ctx: ExtensionContext, state: RuntimeState): void {
-	const value = state.stats.projectedTokens === undefined
-		? `~${Math.round(state.stats.rawTokens / 1000)}K ${state.stats.action}`
-		: `sent ${Math.round(state.stats.projectedTokens / 1000)}K (raw ${Math.round(state.stats.rawTokens / 1000)}K)`;
-	ctx.ui.setStatus("virtual-context", `vctx ${state.mode} ${value}`);
+	if (state.mode === "off") {
+		ctx.ui.setStatus("virtual-context", undefined);
+		return;
+	}
+	const theme = ctx.ui.theme;
+	const fg = theme?.fg?.bind(theme) ?? ((_color: string, text: string) => text);
+	const rawK = Math.round(state.stats.rawTokens / 1000);
+	const prefix = state.mode === "shadow" ? "◈ shadow " : "◈ ";
+	const thresholds = resolveThresholds(state.config, ctx.model?.contextWindow);
+	const bar = statusBar(state.stats.rawTokens / thresholds.swapTokens);
+	if (state.stats.projectedTokens === undefined) {
+		ctx.ui.setStatus("virtual-context", fg("dim", `${prefix}${bar} ~${rawK}K ${state.stats.action}`));
+		return;
+	}
+	const sentK = Math.round(state.stats.projectedTokens / 1000);
+	const compressed = state.stats.projectedTokens < state.stats.rawTokens;
+	const text = compressed ? `${prefix}${bar} ${rawK}K→${sentK}K` : `${prefix}${bar} ${sentK}K`;
+	const color = state.stats.rawTokens >= thresholds.swapTokens
+		? "error"
+		: state.stats.rawTokens >= thresholds.prepareTokens
+			? "warning"
+			: compressed
+				? "accent"
+				: "dim";
+	ctx.ui.setStatus("virtual-context", fg(color, text));
 }
 
 function cancelPending(state: RuntimeState, reason: string): void {
@@ -355,7 +383,8 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			stats: { rawTokens: 0, action: "session_start", overheadTokens: loaded.config.fallbackOverheadTokens, requestCount: 0 },
 		};
 		for (const warning of loaded.warnings) ctx.ui.notify(`pi-virtual-context: ${warning}`, "warning");
-		ctx.ui.setStatus("virtual-context", `vctx ${state.mode}`);
+		// 启动时还没有任何 token 数据，不占用状态栏；首次请求后由 updateFooter 填充
+		ctx.ui.setStatus("virtual-context", undefined);
 		state.telemetry.write({ mode: state.mode, action: "session_start" });
 	});
 
@@ -661,7 +690,7 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			}
 			invalidate(state, `mode_change:${mode}`);
 			state.mode = mode;
-			ctx.ui.setStatus("virtual-context", `vctx ${mode}`);
+			updateFooter(ctx, state);
 			ctx.ui.notify(`pi-virtual-context mode is now ${mode} for this runtime; settings.json is unchanged`, mode === "enabled" ? "warning" : "info");
 		},
 	});
