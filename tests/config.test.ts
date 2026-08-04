@@ -178,37 +178,3 @@ test("project thresholdOverrides replace the global override table", () => {
 	);
 	assert.deepEqual(merged.thresholdOverrides, projectOverrides);
 });
-
-test("failover defaults to enabled with no chains and a six-switch cap", () => {
-	const { config, warnings } = normalizeConfig({});
-	assert.deepEqual(config.failover, {
-		enabled: true,
-		chains: {},
-		maxFailoversPerSession: 6,
-	});
-	assert.deepEqual(warnings, []);
-});
-
-test("normalizes valid failover chains and removes malformed entries with warnings", () => {
-	const { config, warnings } = normalizeConfig({
-		failover: {
-			enabled: "yes",
-			maxFailoversPerSession: 0,
-			chains: {
-				"kimi-coding": [" ark/glm-5.2 ", "missing-model", 42],
-				broken: "ark/glm-5.2",
-				empty: [],
-			},
-		},
-	});
-	assert.deepEqual(config.failover, {
-		enabled: true,
-		chains: { "kimi-coding": ["ark/glm-5.2"] },
-		maxFailoversPerSession: 6,
-	});
-	assert.ok(warnings.some((warning) => warning.includes("failover.enabled")));
-	assert.ok(warnings.some((warning) => warning.includes("positive integer")));
-	assert.ok(warnings.some((warning) => warning.includes("must be provider/modelId")));
-	assert.ok(warnings.some((warning) => warning.includes("must be an array")));
-	assert.ok(warnings.some((warning) => warning.includes("at least one target")));
-});

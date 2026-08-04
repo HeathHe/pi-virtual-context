@@ -11,12 +11,6 @@ import {
 import { ArtifactStore } from "../src/artifacts.ts";
 import { getBackgroundBroker, withBackgroundLease } from "../src/background-broker.ts";
 import {
-	formatModelRef,
-	planFailover,
-	sameModelRef,
-	type FailoverModelRef,
-} from "../src/failover.ts";
-import {
 	DEFAULT_CONFIG,
 	mergeConfigValues,
 	normalizeConfig,
@@ -77,10 +71,6 @@ interface RuntimeState {
 	callsSinceActivation: number;
 	projectionCommitted: boolean;
 	failOpenRequests: number;
-	failoverCount: number;
-	failedOverFrom?: FailoverModelRef;
-	failoverTarget?: FailoverModelRef;
-	suppressedModelSelect?: string;
 	stats: RuntimeStats;
 	lastProjection?: ProjectionSnapshot;
 }
@@ -130,75 +120,6 @@ function statusBar(ratio: number): string {
 
 function activeThresholdModel(ctx: ExtensionContext): { provider?: string; id?: string } | undefined {
 	return ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-}
-
-function activeFailoverModel(ctx: ExtensionContext): FailoverModelRef | undefined {
-	const provider = ctx.model?.provider;
-	const id = ctx.model?.id;
-	return provider && id ? { provider, id } : undefined;
-}
-
-async function setModelPreservingProjection(
-	pi: ExtensionAPI,
-	state: RuntimeState,
-	model: Parameters<ExtensionAPI["setModel"]>[0],
-	target: FailoverModelRef,
-): Promise<boolean> {
-	const expectedModelSelect = formatModelRef(target);
-	state.suppressedModelSelect = expectedModelSelect;
-	try {
-		return await pi.setModel(model);
-	} finally {
-		if (state.suppressedModelSelect === expectedModelSelect) state.suppressedModelSelect = undefined;
-	}
-}
-
-async function attemptFailover(
-	pi: ExtensionAPI,
-	state: RuntimeState,
-	ctx: ExtensionContext,
-	current: FailoverModelRef,
-): Promise<void> {
-	const from = formatModelRef(current);
-	const plan = planFailover(state.config.failover, current, state.failoverCount);
-	if (plan.kind === "none") return;
-	if (plan.kind === "cap_reached") {
-		state.telemetry.write({
-			mode: state.mode,
-			action: "failover_cap_reached",
-			details: { from, failoverCount: state.failoverCount, maxFailoversPerSession: state.config.failover.maxFailoversPerSession },
-		});
-		return;
-	}
-	if (plan.kind === "exhausted") {
-		state.telemetry.write({ mode: state.mode, action: "failover_exhausted", details: { from } });
-		ctx.ui.notify(`${from} 的故障转移链已耗尽，请手动选择模型后重试`, "warning");
-		return;
-	}
-
-	for (const target of plan.candidates) {
-		const model = ctx.modelRegistry.find(target.provider, target.id);
-		if (!model) continue;
-		let switched = false;
-		try {
-			switched = await setModelPreservingProjection(pi, state, model, target);
-		} catch {
-			// Treat an authentication race like a false return and continue the chain.
-		}
-		if (!switched) continue;
-
-		state.failedOverFrom ??= current;
-		state.failoverTarget = target;
-		state.failoverCount += 1;
-		const to = formatModelRef(target);
-		state.telemetry.write({ mode: state.mode, action: "failover_activated", details: { from, to } });
-		ctx.ui.notify(`${from} 限流，已切换到 ${to} 完成本轮`, "warning");
-		pi.sendUserMessage("continue", { deliverAs: "followUp" });
-		return;
-	}
-
-	state.telemetry.write({ mode: state.mode, action: "failover_exhausted", details: { from } });
-	ctx.ui.notify(`${from} 的故障转移链已耗尽，请手动选择模型后重试`, "warning");
 }
 
 function updateFooter(ctx: ExtensionContext, state: RuntimeState): void {
@@ -470,7 +391,6 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 			callsSinceActivation: 0,
 			projectionCommitted: false,
 			failOpenRequests: 0,
-			failoverCount: 0,
 			stats: { rawTokens: 0, action: "session_start", overheadTokens: loaded.config.fallbackOverheadTokens, requestCount: 0 },
 		};
 		for (const warning of loaded.warnings) ctx.ui.notify(`pi-virtual-context: ${warning}`, "warning");
@@ -744,12 +664,8 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 		const transient = lastAssistant.stopReason === "aborted" || TRANSIENT_PROVIDER_ERROR_RE.test(errorMessage);
 		if (transient) {
 			state.telemetry.write({ mode: state.mode, action: "provider_transient_error", details });
-			// Failover only on real provider errors: user aborts ("aborted") keep the
-			// projection but must never trigger a model switch or auto-continue.
-			if (lastAssistant.stopReason === "error") {
-				const current = activeFailoverModel(ctx);
-				if (current) await attemptFailover(pi, state, ctx, current);
-			}
+			// Transient provider errors and user aborts ("aborted") keep the active
+			// projection so the next retry reuses it. No automatic model switch.
 			return;
 		}
 
@@ -767,55 +683,12 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", () => invalidate(state, "session_tree"));
 	pi.on("session_before_switch", () => invalidate(state, "session_before_switch"));
 	pi.on("session_before_fork", () => invalidate(state, "session_before_fork"));
-	pi.on("model_select", (event) => {
-		if (state?.suppressedModelSelect === formatModelRef(event.model)) {
-			state.suppressedModelSelect = undefined;
-			return;
-		}
-		if (state) {
-			state.failedOverFrom = undefined;
-			state.failoverTarget = undefined;
-		}
+	pi.on("model_select", () => {
 		invalidate(state, "model_select");
 	});
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		getBackgroundBroker().setForegroundActive(false);
-		const closingState = state;
-		invalidate(closingState, "session_shutdown");
-		if (
-			closingState?.failedOverFrom
-			&& closingState.failoverTarget
-			&& sameModelRef(activeFailoverModel(ctx), closingState.failoverTarget)
-		) {
-			const target = ctx.modelRegistry.find(closingState.failedOverFrom.provider, closingState.failedOverFrom.id);
-			let restored = false;
-			try {
-				if (target) {
-					const result = await timeout(
-						setModelPreservingProjection(pi, closingState, target, closingState.failedOverFrom),
-						3_000,
-					);
-					restored = result === true;
-				}
-			} catch {
-				// Shutdown must continue even when restoring the persisted default fails.
-			}
-			if (restored) {
-				closingState.telemetry.write({
-					mode: closingState.mode,
-					action: "failback",
-					details: { from: formatModelRef(closingState.failoverTarget), to: formatModelRef(closingState.failedOverFrom), reason: "session_shutdown" },
-				});
-				closingState.failedOverFrom = undefined;
-				closingState.failoverTarget = undefined;
-			} else {
-				closingState.telemetry.write({
-					mode: closingState.mode,
-					action: "failback_failed",
-					details: { to: formatModelRef(closingState.failedOverFrom), reason: target ? "set_model_failed_or_timed_out" : "model_not_found" },
-				});
-			}
-		}
+		invalidate(state, "session_shutdown");
 		ctx.ui.setStatus("virtual-context", undefined);
 		state = undefined;
 	});
@@ -851,38 +724,4 @@ export default function virtualContextExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerCommand("vctx:failback", {
-		description: "Switch back to the model active before provider failover",
-		handler: async (_args, ctx) => {
-			if (!state?.failedOverFrom) {
-				ctx.ui.notify("当前会话没有可恢复的 failover 状态", "info");
-				return;
-			}
-			const targetRef = state.failedOverFrom;
-			const from = activeFailoverModel(ctx);
-			const target = ctx.modelRegistry.find(targetRef.provider, targetRef.id);
-			if (!target) {
-				ctx.ui.notify(`无法找到原模型 ${formatModelRef(targetRef)}，请手动切换`, "warning");
-				return;
-			}
-			let restored = false;
-			try {
-				restored = await setModelPreservingProjection(pi, state, target, targetRef);
-			} catch {
-				// Report the failed restore without disturbing the current fallback model.
-			}
-			if (!restored) {
-				ctx.ui.notify(`无法切回 ${formatModelRef(targetRef)}，请检查 API key`, "warning");
-				return;
-			}
-			state.telemetry.write({
-				mode: state.mode,
-				action: "failback",
-				details: { from: from ? formatModelRef(from) : "unknown", to: formatModelRef(targetRef), reason: "manual" },
-			});
-			state.failedOverFrom = undefined;
-			state.failoverTarget = undefined;
-			ctx.ui.notify(`已切回 ${formatModelRef(targetRef)}`, "info");
-		},
-	});
 }

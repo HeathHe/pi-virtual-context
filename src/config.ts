@@ -17,17 +17,10 @@ export interface ThresholdOverride {
 	emergencyTokens: number;
 }
 
-export interface FailoverConfig {
-	enabled: boolean;
-	chains: Record<string, string[]>;
-	maxFailoversPerSession: number;
-}
-
 export interface VirtualContextConfig {
 	mode: VirtualContextMode;
 	thresholdsMode: ThresholdsMode;
 	thresholdOverrides: ThresholdOverride[];
-	failover: FailoverConfig;
 	prepareTokens: number;
 	swapTokens: number;
 	targetTokens: number;
@@ -63,11 +56,6 @@ export const DEFAULT_CONFIG: VirtualContextConfig = {
 	mode: "shadow",
 	thresholdsMode: "static",
 	thresholdOverrides: [],
-	failover: {
-		enabled: true,
-		chains: {},
-		maxFailoversPerSession: 6,
-	},
 	prepareTokens: 80_000,
 	swapTokens: 95_000,
 	targetTokens: 65_000,
@@ -124,62 +112,6 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function positiveIntegerOrUndefined(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
-}
-
-function normalizeFailover(value: unknown, warnings: string[]): FailoverConfig {
-	const input = record(value);
-	if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value))) {
-		warnings.push("failover must be an object; using defaults");
-	}
-
-	const enabled = typeof input.enabled === "boolean" ? input.enabled : DEFAULT_CONFIG.failover.enabled;
-	if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
-		warnings.push(`failover.enabled must be a boolean; using ${enabled}`);
-	}
-
-	const rawMax = input.maxFailoversPerSession;
-	const maxFailoversPerSession = typeof rawMax === "number" && Number.isInteger(rawMax) && rawMax > 0
-		? rawMax
-		: DEFAULT_CONFIG.failover.maxFailoversPerSession;
-	if (rawMax !== undefined && rawMax !== maxFailoversPerSession) {
-		warnings.push(`failover.maxFailoversPerSession must be a positive integer; using ${maxFailoversPerSession}`);
-	}
-
-	const chains: Record<string, string[]> = {};
-	if (input.chains !== undefined && (input.chains === null || typeof input.chains !== "object" || Array.isArray(input.chains))) {
-		warnings.push("failover.chains must be an object; ignoring it");
-	} else {
-		for (const [rawProvider, rawTargets] of Object.entries(record(input.chains))) {
-			const provider = rawProvider.trim();
-			if (!provider) {
-				warnings.push("failover.chains contains an empty provider key; ignoring it");
-				continue;
-			}
-			if (!Array.isArray(rawTargets)) {
-				warnings.push(`failover.chains[${JSON.stringify(rawProvider)}] must be an array; ignoring it`);
-				continue;
-			}
-			const targets: string[] = [];
-			for (const [index, rawTarget] of rawTargets.entries()) {
-				if (typeof rawTarget !== "string") {
-					warnings.push(`failover.chains[${JSON.stringify(rawProvider)}][${index}] must be provider/modelId; ignoring it`);
-					continue;
-				}
-				const separator = rawTarget.indexOf("/");
-				const targetProvider = separator > 0 ? rawTarget.slice(0, separator).trim() : "";
-				const targetId = separator > 0 ? rawTarget.slice(separator + 1).trim() : "";
-				if (!targetProvider || !targetId) {
-					warnings.push(`failover.chains[${JSON.stringify(rawProvider)}][${index}] must be provider/modelId; ignoring it`);
-					continue;
-				}
-				targets.push(`${targetProvider}/${targetId}`);
-			}
-			if (targets.length > 0) chains[provider] = targets;
-			else if (rawTargets.length === 0) warnings.push(`failover.chains[${JSON.stringify(rawProvider)}] must contain at least one target; ignoring it`);
-		}
-	}
-
-	return { enabled, chains, maxFailoversPerSession };
 }
 
 function normalizeThresholdOverrides(value: unknown, warnings: string[]): ThresholdOverride[] {
@@ -261,7 +193,6 @@ export function normalizeConfig(value: unknown): NormalizedConfig {
 		mode,
 		thresholdsMode,
 		thresholdOverrides: normalizeThresholdOverrides(input.thresholdOverrides, warnings),
-		failover: normalizeFailover(input.failover, warnings),
 		prepareTokens: positiveInteger(input.prepareTokens, DEFAULT_CONFIG.prepareTokens, "prepareTokens", warnings),
 		swapTokens: positiveInteger(input.swapTokens, DEFAULT_CONFIG.swapTokens, "swapTokens", warnings),
 		targetTokens: positiveInteger(input.targetTokens, DEFAULT_CONFIG.targetTokens, "targetTokens", warnings),
